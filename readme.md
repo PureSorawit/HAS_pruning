@@ -13,6 +13,7 @@ Clone this repository and install dependencies:
 ```bash
 git clone https://github.com/PureSorawit/HAS_pruning.git
 cd HAS_pruning
+```
 
 ## 2. Download the model
 
