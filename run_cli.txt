@@ -1,1 +1,4 @@
 python has_pruning.py --ckpt ./vit_base_cifar100.pth --model vit_base_patch16_224 --mlp 0.30 --heads 0.15 --qkv 0.10 --max-warmup-batches 64 --score-stride 1 --amp --save vit_base_pruned_taylor.pth --export-prefix ./exports/vitb_cifar100
+
+
+python has_pruning.py --ckpt ./checkpoints/vit_base_cifar100.pth --model vit_base_patch16_224 --mlp 0.30 --heads 0.15 --qkv 0.10 --max-warmup-batches 64 --score-stride 1 --amp --save vit_base_pruned_has.pth --export-prefix ./exports/vitb_cifar100_has
