@@ -50,7 +50,6 @@ def total_heads(model: nn.Module) -> int:
 
 # -------------------------------------------------
 # Importance (first-order Hessian-aware/Taylor: sum (w*grad) over group, squared)
-# Ref: Eq. (6) in Global ViT Pruning with Hessian-Aware Saliency (Yang et al.)
 # -------------------------------------------------
 def collect_importance_taylor(
     model: nn.Module,
@@ -405,15 +404,18 @@ def run(args):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     use_amp = args.amp and torch.cuda.is_available()
     print(f"CUDA: {torch.cuda.is_available()} | AMP: {use_amp}")
-    if torch.cuda.is_available(): print(f"GPU: {torch.cuda.get_device_name(0)}")
+    if torch.cuda.is_available():
+        print(f"GPU: {torch.cuda.get_device_name(0)}")
 
     model = timm.create_model(args.model, pretrained=False, num_classes=100).to(device)
 
     sd = torch.load(args.ckpt, map_location="cpu")
-    if isinstance(sd, dict) and "state_dict" in sd: sd = sd["state_dict"]
+    if isinstance(sd, dict) and "state_dict" in sd:
+        sd = sd["state_dict"]
     missing, unexpected = model.load_state_dict(sd, strict=False)
     print(f"[ckpt] loaded (missing={len(missing)}, unexpected={len(unexpected)}).")
-    print(f"Params: {count_params(model)/1e6:.2f}M | FFN units={total_mlp_units(model)} | Heads={total_heads(model)}")
+    print(f"Params: {count_params(model)/1e6:.2f}M | "
+          f"FFN units={total_mlp_units(model)} | Heads={total_heads(model)}")
 
     train_loader, val_loader = build_loaders(img_size=224, batch_size=128, workers=2)
 
@@ -421,86 +423,109 @@ def run(args):
     b_loss, b_acc = evaluate(model, val_loader, device, use_amp)
     print(f"[Baseline] Val loss {b_loss:.4f}  Acc {b_acc*100:.2f}%  (t={time.time()-t0:.1f}s)")
 
-    # optionally export scores=empty + masks=full-ones (even if no pruning)
-    # Collect importance (Taylor)
-    print(f"[Warmup] Collecting importance (max_batches={args.max_warmup_batches}, stride={args.score_stride}) ...")
+    print(f"[Warmup] Collecting importance (max_batches={args.max_warmup_batches}, "
+          f"stride={args.score_stride}) ...")
     t1 = time.time()
     ffn_imp, head_imp, qkv_dim_imp = collect_importance_taylor(
         model, train_loader, device,
         max_warmup_batches=args.max_warmup_batches,
         score_stride=args.score_stride,
     )
-    print(f"[Warmup] Done in {time.time()-t1:.1f}s | scored: FFN={len(ffn_imp)} Heads={len(head_imp)} QKV-dims={len(qkv_dim_imp)}")
+    print(f"[Warmup] Done in {time.time()-t1:.1f}s | scored: "
+          f"FFN={len(ffn_imp)} Heads={len(head_imp)} QKV-dims={len(qkv_dim_imp)}")
 
-    # prune
     to_remove_units, to_remove_heads, to_remove_dims = {}, {}, {}
+
     if args.mlp > 0:
         total_before = total_mlp_units(model)
         to_remove_units = pick_ffn_units(ffn_imp, model, args.mlp, chunk=args.chunk)
         removed = sum(len(v) for v in to_remove_units.values())
-        p0 = count_params(model); apply_ffn_pruning(model, to_remove_units); p1 = count_params(model)
-        print(f"[FFN] Removed {removed}/{total_before} (~{100*removed/total_before:.1f}%). Params {p0/1e6:.2f}M -> {p1/1e6:.2f}M")
+        print(f"[FFN] Planned removal: {removed}/{total_before} "
+              f"(~{100.0*removed/total_before:.1f}%).")
+
     if args.heads > 0:
         total_before = total_heads(model)
         to_remove_heads = pick_heads(head_imp, model, args.heads)
         removed = sum(len(v) for v in to_remove_heads.values())
+        print(f"[HEADS] Planned removal: {removed}/{total_before} "
+              f"(~{100.0*removed/total_before:.1f}%).")
+
+    if args.qkv > 0:
+        to_remove_dims = pick_qkv_dims(qkv_dim_imp, model, args.qkv)
+        per_block_rm = {l: len(v) for l, v in to_remove_dims.items()}
+        print(f"[QKV] Planned per-head dim removals per block: {per_block_rm}")
+
+    ffn_mask = {}
+    for l, blk in enumerate(model.blocks):
+        H_orig = blk.mlp.fc1.out_features
+        rm = set(to_remove_units.get(l, []))
+        keep = sorted(set(range(H_orig)) - rm)
+        m = np.zeros(H_orig, dtype=int)
+        m[keep] = 1
+        ffn_mask[l] = m.tolist()
+
+    head_mask = {}
+    for l, blk in enumerate(model.blocks):
+        nh_orig = blk.attn.num_heads
+        rm = set(to_remove_heads.get(l, []))
+        keep = sorted(set(range(nh_orig)) - rm)
+        m = np.zeros(nh_orig, dtype=int)
+        m[keep] = 1
+        head_mask[l] = m.tolist()
+
+    qkv_dim_mask = {}
+    for l, blk in enumerate(model.blocks):
+        nh = blk.attn.num_heads
+        hd_orig = blk.attn.proj.in_features // nh
+        rm = set(to_remove_dims.get(l, []))
+        keep = sorted(set(range(hd_orig)) - rm)
+        m = np.zeros(hd_orig, dtype=int)
+        m[keep] = 1
+        qkv_dim_mask[l] = m.tolist()
+
+    if args.export_prefix:
+        export_scores_and_masks(
+            args.export_prefix,
+            ffn_imp, head_imp, qkv_dim_imp,
+            ffn_mask, head_mask, qkv_dim_mask
+        )
+        print(f"[Export] wrote {args.export_prefix}_scores.json/.npy and "
+              f"{args.export_prefix}_masks.json/.npy (PRE-PRUNE)")
+
+    if args.mlp > 0:
+        p0 = count_params(model)
+        apply_ffn_pruning(model, to_remove_units)
+        p1 = count_params(model)
+        print(f"[FFN] Applied pruning. Params {p0/1e6:.2f}M -> {p1/1e6:.2f}M")
+
+    if args.heads > 0:
+        total_before = total_heads(model) + sum(len(v) for v in to_remove_heads.values())
         apply_head_pruning(model, to_remove_heads)
-        print(f"[HEADS] Removed {removed}/{total_before} (~{100*removed/total_before:.1f}%). Heads per block: {[b.attn.num_heads for b in model.blocks]}")
+        print(f"[HEADS] Applied pruning. Heads per block now: "
+              f"{[b.attn.num_heads for b in model.blocks]}")
+
     if args.qkv > 0:
         before = []
         for blk in model.blocks:
             nh = blk.attn.num_heads
             before.append(blk.attn.proj.in_features // nh)
-        to_remove_dims = pick_qkv_dims(qkv_dim_imp, model, args.qkv)
         apply_qkv_dim_pruning(model, to_remove_dims)
         after = []
         for blk in model.blocks:
             nh = blk.attn.num_heads
             after.append(blk.attn.proj.in_features // nh)
-        print(f"[QKV] per-head dims (before -> after per block): {list(zip(before, after))}")
+        print(f"[QKV] per-head dims (before -> after per block): "
+              f"{list(zip(before, after))}")
 
-    # build binary masks (1 keep, 0 prune) for export
-    ffn_mask = {}
-    for l, blk in enumerate(model.blocks):
-        H_now = blk.mlp.fc1.out_features
-        # figure original H by combining removed+kept
-        rm = set(to_remove_units.get(l, []))
-        H_orig = H_now + len(rm)
-        keep = sorted(set(range(H_orig)) - rm)
-        m = np.zeros(H_orig, dtype=int); m[keep] = 1
-        ffn_mask[l] = m.tolist()
-    head_mask = {}
-    for l, blk in enumerate(model.blocks):
-        nh_now = blk.attn.num_heads
-        rm = set(to_remove_heads.get(l, []))
-        nh_orig = nh_now + len(rm)
-        keep = sorted(set(range(nh_orig)) - rm)
-        m = np.zeros(nh_orig, dtype=int); m[keep] = 1
-        head_mask[l] = m.tolist()
-    qkv_dim_mask = {}
-    for l, blk in enumerate(model.blocks):
-        nh = blk.attn.num_heads
-        hd_now = blk.attn.proj.in_features // nh
-        rm = set(to_remove_dims.get(l, []))
-        hd_orig = hd_now + len(rm)
-        keep = sorted(set(range(hd_orig)) - rm)
-        m = np.zeros(hd_orig, dtype=int); m[keep] = 1
-        qkv_dim_mask[l] = m.tolist()
-
-    # eval after prune
     t2 = time.time()
     a_loss, a_acc = evaluate(model, val_loader, device, use_amp)
-    print(f"[After]  Val loss {a_loss:.4f}  Acc {a_acc*100:.2f}%  (Δt={time.time()-t2:.1f}s)")
-
-    # export
-    if args.export_prefix:
-        export_scores_and_masks(args.export_prefix, ffn_imp, head_imp, qkv_dim_imp,
-                                ffn_mask, head_mask, qkv_dim_mask)
-        print(f"[Export] wrote {args.export_prefix}_scores.json/.npy and {args.export_prefix}_masks.json/.npy")
+    print(f"[After]  Val loss {a_loss:.4f}  Acc {a_acc*100:.2f}%  "
+          f"(Δt={time.time()-t2:.1f}s)")
 
     if args.save:
         torch.save(model.state_dict(), args.save)
         print(f"[Save] {args.save}")
+
 
 def main():
     p = argparse.ArgumentParser()
